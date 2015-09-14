@@ -299,12 +299,14 @@ func TestCompareKeys(t *testing.T) {
 		},
 	}
 
-	send := func(data []string) <-chan string {
-		ch := make(chan string)
+	send := func(data []string) <-chan *Object {
+		ch := make(chan *Object)
 
 		go func() {
 			for _, d := range data {
-				ch <- d
+				ch <- &Object{
+					Key: d,
+				}
 			}
 
 			close(ch)
@@ -313,14 +315,14 @@ func TestCompareKeys(t *testing.T) {
 		return ch
 	}
 
-	receive := func(out chan<- []string) chan<- string {
-		ch := make(chan string)
+	receive := func(out chan<- []string) chan<- *Object {
+		ch := make(chan *Object)
 
 		go func() {
 			all := []string{}
 
 			for s := range ch {
-				all = append(all, s)
+				all = append(all, s.Key)
 			}
 
 			out <- all
@@ -334,7 +336,7 @@ func TestCompareKeys(t *testing.T) {
 		toCopy := make(chan []string, 1)
 		toDelete := make(chan []string, 1)
 
-		compareKeys(send(d.SourceKeys), send(d.DestKeys), receive(toCopy), receive(toDelete))
+		compareObjects(send(d.SourceKeys), send(d.DestKeys), receive(toCopy), receive(toDelete))
 
 		if keys := <-toCopy; !reflect.DeepEqual(d.ToCopy, keys) {
 			t.Errorf("Keys to copy don't match for test case %s: expected %s, got %s", d.Name, strings.Join(d.ToCopy, ", "), strings.Join(keys, ", "))

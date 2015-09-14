@@ -21,6 +21,11 @@ type Bucket struct {
 	Client *s3.S3
 }
 
+type Object struct {
+	Key  string
+	Size uint64
+}
+
 func NewBucket(bucketUrl string, region string) (*Bucket, error) {
 	u, err := url.Parse(bucketUrl)
 
@@ -65,7 +70,7 @@ func NewBucket(bucketUrl string, region string) (*Bucket, error) {
 	}, nil
 }
 
-func listBucket(bucket *Bucket, out chan string) error {
+func listBucket(bucket *Bucket, out chan *Object) error {
 	defer close(out)
 
 	listRequest := s3.ListObjectsInput{
@@ -75,7 +80,10 @@ func listBucket(bucket *Bucket, out chan string) error {
 
 	callback := func(result *s3.ListObjectsOutput, lastPage bool) bool {
 		for _, obj := range result.Contents {
-			out <- (*obj.Key)[len(bucket.Prefix):]
+			out <- &Object{
+				Key:  (*obj.Key)[len(bucket.Prefix):],
+				Size: uint64(*obj.Size),
+			}
 		}
 
 		return true
@@ -84,7 +92,7 @@ func listBucket(bucket *Bucket, out chan string) error {
 	return bucket.Client.ListObjectsPages(&listRequest, callback)
 }
 
-func copyKeys(sourceBucket, destBucket *Bucket, keys <-chan string) error {
+func copyObjects(sourceBucket, destBucket *Bucket, objects <-chan *Object) error {
 	const concurrency = 100
 	copyErrors := make(chan error, concurrency)
 	wg := sync.WaitGroup{}
@@ -92,9 +100,9 @@ func copyKeys(sourceBucket, destBucket *Bucket, keys <-chan string) error {
 	worker := func() error {
 		defer wg.Done()
 
-		for key := range keys {
-			if err := copyKey(sourceBucket, destBucket, key); err != nil {
-				return fmt.Errorf("Error while copying key %s: %s", key, err)
+		for object := range objects {
+			if err := copyObject(sourceBucket, destBucket, object); err != nil {
+				return fmt.Errorf("Error while copying key %s: %s", object.Key, err)
 			}
 		}
 
@@ -122,12 +130,12 @@ func copyKeys(sourceBucket, destBucket *Bucket, keys <-chan string) error {
 	return err
 }
 
-func copyKey(sourceBucket, destBucket *Bucket, key string) error {
-	sourceKey := sourceBucket.Prefix + key
+func copyObject(sourceBucket, destBucket *Bucket, object *Object) error {
+	sourceKey := sourceBucket.Prefix + object.Key
 	req := s3.CopyObjectInput{
 		Bucket:     aws.String(destBucket.Name),
 		CopySource: aws.String(sourceBucket.Name + "/" + sourceKey),
-		Key:        aws.String(destBucket.Prefix + key),
+		Key:        aws.String(destBucket.Prefix + object.Key),
 	}
 
 	if !*dryRun {
@@ -136,12 +144,12 @@ func copyKey(sourceBucket, destBucket *Bucket, key string) error {
 		}
 	}
 
-	log.Printf("COPY   %s", key)
+	log.Printf("COPY   %s", object.Key)
 
 	return nil
 }
 
-func deleteKeys(bucket *Bucket, keys <-chan string) error {
+func deleteObjects(bucket *Bucket, objects <-chan *Object) error {
 	buffer := make([]string, 0, 100)
 
 	doDelete := func() error {
@@ -167,10 +175,10 @@ func deleteKeys(bucket *Bucket, keys <-chan string) error {
 		return nil
 	}
 
-	for key := range keys {
-		buffer = append(buffer, key)
+	for object := range objects {
+		buffer = append(buffer, object.Key)
 
-		log.Printf("DELETE %s", key)
+		log.Printf("DELETE %s", object.Key)
 
 		if len(buffer) == cap(buffer) {
 			if err := doDelete(); err != nil {
@@ -190,24 +198,24 @@ func deleteKeys(bucket *Bucket, keys <-chan string) error {
 	return nil
 }
 
-func compareKeys(sourceKeys, destKeys <-chan string, toCopy, toDelete chan<- string) {
+func compareObjects(sourceObjects, destObjects <-chan *Object, toCopy, toDelete chan<- *Object) {
 	sourceFinished := false
 	destFinished := false
 
-	var sourceCurrent *string
-	var destCurrent *string
+	var sourceCurrent *Object
+	var destCurrent *Object
 
-	buffer := func(from <-chan string, to **string, finished *bool) {
+	buffer := func(from <-chan *Object, to **Object, finished *bool) {
 		if *finished || *to != nil {
 			return
 		}
 
-		key, ok := <-from
+		obj, ok := <-from
 
 		*finished = !ok
 
 		if ok {
-			*to = &key
+			*to = obj
 		}
 	}
 
@@ -219,7 +227,7 @@ func compareKeys(sourceKeys, destKeys <-chan string, toCopy, toDelete chan<- str
 		Delete
 	)
 
-	cmp := func(a, b *string) Action {
+	cmp := func(a, b *Object) Action {
 		if a == nil && b == nil {
 			return Skip
 		}
@@ -232,11 +240,11 @@ func compareKeys(sourceKeys, destKeys <-chan string, toCopy, toDelete chan<- str
 			return Copy
 		}
 
-		if *a == *b {
+		if a.Key == b.Key {
 			return Skip
 		}
 
-		if *a > *b {
+		if a.Key > b.Key {
 			return Delete
 		}
 
@@ -244,8 +252,8 @@ func compareKeys(sourceKeys, destKeys <-chan string, toCopy, toDelete chan<- str
 	}
 
 	for {
-		buffer(sourceKeys, &sourceCurrent, &sourceFinished)
-		buffer(destKeys, &destCurrent, &destFinished)
+		buffer(sourceObjects, &sourceCurrent, &sourceFinished)
+		buffer(destObjects, &destCurrent, &destFinished)
 
 		if sourceFinished && destFinished {
 			close(toCopy)
@@ -257,72 +265,72 @@ func compareKeys(sourceKeys, destKeys <-chan string, toCopy, toDelete chan<- str
 
 		switch action {
 		case Copy:
-			toCopy <- *sourceCurrent
+			toCopy <- sourceCurrent
 			sourceCurrent = nil
 		case Skip:
 			if *overwrite {
-				toCopy <- *sourceCurrent
+				toCopy <- sourceCurrent
 			} else {
-				log.Printf("SKIP   %s", *sourceCurrent)
+				log.Printf("SKIP   %s", sourceCurrent.Key)
 			}
 
 			sourceCurrent = nil
 			destCurrent = nil
 		case Delete:
-			toDelete <- *destCurrent
+			toDelete <- destCurrent
 			destCurrent = nil
 		}
 	}
 }
 
 func runCopy(sourceBucket, destBucket *Bucket) error {
-	const keyChannelBufferSize = 1024
+	const objectChannelBufferSize = 1024
 
-	sourceKeys := make(chan string, keyChannelBufferSize)
-	destKeys := make(chan string, keyChannelBufferSize)
-	keysToCopy := make(chan string, keyChannelBufferSize)
-	keysToDelete := make(chan string, keyChannelBufferSize)
-	listSourceKeysError := make(chan error, 1)
-	listDestKeysError := make(chan error, 1)
+	sourceObjects := make(chan *Object, objectChannelBufferSize)
+	destObjects := make(chan *Object, objectChannelBufferSize)
+	objectsToCopy := make(chan *Object, objectChannelBufferSize)
+	objectsToDelete := make(chan *Object, objectChannelBufferSize)
+	listSourceObjectsError := make(chan error, 1)
+	listDestObjectsError := make(chan error, 1)
 	copyError := make(chan error, 1)
 	deleteError := make(chan error, 1)
 
 	go func() {
-		listSourceKeysError <- listBucket(sourceBucket, sourceKeys)
+		listSourceObjectsError <- listBucket(sourceBucket, sourceObjects)
 	}()
 
 	go func() {
-		listDestKeysError <- listBucket(destBucket, destKeys)
+		listDestObjectsError <- listBucket(destBucket, destObjects)
 	}()
 
 	go func() {
-		copyError <- copyKeys(sourceBucket, destBucket, keysToCopy)
+		copyError <- copyObjects(sourceBucket, destBucket, objectsToCopy)
 	}()
 
 	go func() {
-		deleteError <- deleteKeys(destBucket, keysToDelete)
+		deleteError <- deleteObjects(destBucket, objectsToDelete)
 	}()
 
-	compareKeys(sourceKeys, destKeys, keysToCopy, keysToDelete)
+	compareObjects(sourceObjects, destObjects, objectsToCopy, objectsToDelete)
 
 	for {
-		if listSourceKeysError == nil && listDestKeysError == nil && copyError == nil && deleteError == nil {
+		if listSourceObjectsError == nil && listDestObjectsError == nil && copyError == nil && deleteError == nil {
 			return nil
 		}
 
 		select {
-		case err := <-listSourceKeysError:
+		case err := <-listSourceObjectsError:
 			if err != nil {
 				return fmt.Errorf("Error while listing keys in source bucket: %s", err)
 			}
 
-			listSourceKeysError = nil
-		case err := <-listDestKeysError:
+			listSourceObjectsError = nil
+		case err := <-listDestObjectsError:
 			if err != nil {
 				return fmt.Errorf("Error while listing keys in destination bucket: %s", err)
 			}
 
-			listDestKeysError = nil
+			listDestObjectsError = nil
 		case err := <-copyError:
 			if err != nil {
 				return fmt.Errorf("Error while copying keys to destination bucket: %s", err)
