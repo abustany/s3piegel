@@ -343,6 +343,7 @@ var sourceRegion = flag.String("sourceRegion", "", "Region of the source S3 buck
 var destRegion = flag.String("destRegion", "", "Region of the destination S3 bucket (auto detected if not specified)")
 var dryRun = flag.Bool("dryRun", false, "Don't actually do the copy")
 var overwrite = flag.Bool("overwrite", false, "Force copy even if destination key already exists")
+var opTimeout = flag.Duration("opTimeout", 3*time.Minute, "Timeout for S3 operations")
 
 func main() {
 	flag.Usage = func() {
@@ -371,7 +372,7 @@ Additional command line options:
 	defaults.DefaultConfig.Region = aws.String("us-east-1")
 	defaults.DefaultConfig.S3ForcePathStyle = aws.Bool(true)
 	defaults.DefaultConfig.MaxRetries = aws.Int(10)
-	http.DefaultClient.Timeout = 3 * time.Minute
+	http.DefaultClient.Timeout = *opTimeout
 
 	sourceUrl := flag.Arg(0)
 	destUrl := flag.Arg(1)
