@@ -131,6 +131,24 @@ func copyObjects(sourceBucket, destBucket *Bucket, objects <-chan *Object) error
 }
 
 func copyObject(sourceBucket, destBucket *Bucket, object *Object) error {
+	const tooBigForSimpleCopy = 50 * 1024 * 1024 // bytes
+
+	var err error
+
+	if !*dryRun {
+		if object.Size < tooBigForSimpleCopy {
+			err = copyObjectSimple(sourceBucket, destBucket, object)
+		} else {
+			err = copyObjectMultipart(sourceBucket, destBucket, object)
+		}
+	}
+
+	log.Printf("COPY   %s", object.Key)
+
+	return err
+}
+
+func copyObjectSimple(sourceBucket, destBucket *Bucket, object *Object) error {
 	sourceKey := sourceBucket.Prefix + object.Key
 	req := s3.CopyObjectInput{
 		Bucket:     aws.String(destBucket.Name),
@@ -138,13 +156,117 @@ func copyObject(sourceBucket, destBucket *Bucket, object *Object) error {
 		Key:        aws.String(destBucket.Prefix + object.Key),
 	}
 
-	if !*dryRun {
-		if _, err := destBucket.Client.CopyObject(&req); err != nil {
-			return err
-		}
+	if _, err := destBucket.Client.CopyObject(&req); err != nil {
+		return err
 	}
 
-	log.Printf("COPY   %s", object.Key)
+	return nil
+}
+
+func copyObjectMultipart(sourceBucket, destBucket *Bucket, object *Object) (err error) {
+	const copyPartSize = 50 * 1024 * 1024
+
+	sourceKey := sourceBucket.Prefix + object.Key
+	destKey := destBucket.Prefix + object.Key
+
+	// First HEAD the object to retrieve the metadata
+	headReq := s3.HeadObjectInput{
+		Bucket: aws.String(sourceBucket.Name),
+		Key:    aws.String(sourceKey),
+	}
+
+	headRes, err := sourceBucket.Client.HeadObject(&headReq)
+
+	if err != nil {
+		return fmt.Errorf("Error while retrieving object metadata: %s", err)
+	}
+
+	req := s3.CreateMultipartUploadInput{
+		Bucket:       aws.String(destBucket.Name),
+		Key:          aws.String(destKey),
+		ContentType:  headRes.ContentType,
+		Metadata:     headRes.Metadata,
+		StorageClass: headRes.StorageClass,
+	}
+
+	res, err := destBucket.Client.CreateMultipartUpload(&req)
+
+	if err != nil {
+		return fmt.Errorf("Error while starting multipart upload: %s", err)
+	}
+
+	// Multipart upload is started, from now on, if an error happens, try to
+	// abort it
+	defer func() {
+		if err != nil {
+			log.Printf("Error while copying key %s: %s. Aborting multipart upload", destKey, err)
+
+			req := s3.AbortMultipartUploadInput{
+				Bucket:   aws.String(destBucket.Name),
+				Key:      aws.String(destKey),
+				UploadId: res.UploadId,
+			}
+
+			if _, err := destBucket.Client.AbortMultipartUpload(&req); err != nil {
+				log.Printf("Error while aborting multipart copy for key %s: %s", destKey, err)
+			}
+		}
+	}()
+
+	startRange := uint64(0)
+	completedParts := []*s3.CompletedPart{}
+
+	nextRange := func() string {
+		endRange := startRange + copyPartSize
+
+		if endRange >= object.Size {
+			endRange = object.Size - 1
+		}
+
+		rangeString := fmt.Sprintf("bytes=%d-%d", startRange, endRange)
+		startRange = endRange + 1
+
+		return rangeString
+	}
+
+	copyReq := s3.UploadPartCopyInput{
+		Bucket:     aws.String(destBucket.Name),
+		Key:        aws.String(destKey),
+		CopySource: aws.String(sourceBucket.Name + "/" + sourceKey),
+		UploadId:   res.UploadId,
+	}
+
+	for startRange < object.Size {
+		partNumber := int64(1 + len(completedParts))
+		copyReq.CopySourceRange = aws.String(nextRange())
+		copyReq.PartNumber = aws.Int64(partNumber)
+
+		res, err := destBucket.Client.UploadPartCopy(&copyReq)
+
+		if err != nil {
+			return fmt.Errorf("Error while copying part: %s", err)
+		}
+
+		completedPart := s3.CompletedPart{
+			PartNumber: aws.Int64(partNumber),
+			ETag:       res.CopyPartResult.ETag,
+		}
+
+		completedParts = append(completedParts, &completedPart)
+	}
+
+	completeReq := s3.CompleteMultipartUploadInput{
+		Bucket:   aws.String(destBucket.Name),
+		Key:      aws.String(destKey),
+		UploadId: res.UploadId,
+		MultipartUpload: &s3.CompletedMultipartUpload{
+			Parts: completedParts,
+		},
+	}
+
+	if _, err := destBucket.Client.CompleteMultipartUpload(&completeReq); err != nil {
+		return fmt.Errorf("Error while completing copy: %s", err)
+	}
 
 	return nil
 }
